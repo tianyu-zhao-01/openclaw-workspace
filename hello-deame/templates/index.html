@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+</head>
+<body>
+    <h1>Hello, Deame!</h1>
+    <p>Welcome to your Flask project.</p>
+    <p>
+        <button type="button" id="btn-server-time">显示当前系统时间</button>
+        <span id="server-time" aria-live="polite"></span>
+    </p>
+    <script>
+        document.getElementById('btn-server-time').addEventListener('click', async function () {
+            const el = document.getElementById('server-time');
+            el.textContent = '加载中…';
+            try {
+                const res = await fetch('/api/time');
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+                el.textContent = '服务器时间：' + data.display;
+            } catch (e) {
+                el.textContent = '获取失败：' + e.message;
+            }
+        });
+    </script>
+</body>
+</html>

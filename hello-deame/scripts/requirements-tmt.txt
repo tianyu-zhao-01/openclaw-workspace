@@ -1,0 +1,2 @@
+# 使用腾讯翻译君（TMT）时安装：pip install -r requirements-tmt.txt
+tencentcloud-sdk-python>=3.0.1

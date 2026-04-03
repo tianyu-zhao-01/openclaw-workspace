@@ -5,7 +5,7 @@
 
 流程（择一）：
 • 配置 OPENAI_API_KEY：LLM 译标题 + 生成 GitHub 百字摘要。
-• 或配置 TENCENT_SECRET_ID + TENCENT_SECRET_KEY（需 pip 安装 tencentcloud-sdk-python）：腾讯翻译君批量翻译标题与仓库说明，摘要截断至百字（机翻非「重写」）。
+• 或配置腾讯密钥：TENCENT_SECRET_ID + TENCENT_SECRET_KEY（亦支持 TENCENT_TRANSLATE_SECRET_ID / KEY），需 pip 安装 tencentcloud-sdk-python；区域可用 TENCENT_TMT_REGION 或 TENCENT_TRANSLATE_REGION。
 未配置时：界面中文、正文多为英文；可仅用 OPENAI 做整篇第二步（BRIEF_LLM_MODE）。
 
 环境变量见 config.example.env；腾讯依赖见 requirements-tmt.txt。
@@ -17,6 +17,7 @@ import copy
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -258,7 +259,7 @@ def _github_repos_to_items_fallback_en(repos: list[dict[str, Any]]) -> list[Item
             line += f" — {desc[:120]}{'…' if len(desc) > 120 else ''}"
         out.append(
             Item(
-                title="（未配置 OPENAI_API_KEY，无法生成百字内中文摘要；以下为英文索引）\n" + line,
+                title=_github_fallback_summary_hint() + "\n" + line,
                 url=html,
                 source="GitHub 高星",
                 repo_full_name=name,
@@ -295,6 +296,64 @@ def _github_repos_to_items_with_summaries(
 
 def fetch_github_repos() -> list[Item]:
     return _github_repos_to_items_fallback_en(_merge_github_repos())
+
+
+def _github_fallback_summary_hint() -> str:
+    """说明为何没有百字中文摘要（避免只写 OPENAI 造成误解）。"""
+    has_oai = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    has_sid = bool(_env_tencent_secret_id())
+    has_sk = bool(_env_tencent_secret_key())
+    sdk_ok = _tencent_sdk_import() is not None
+    parts = [
+        "（未能生成百字内中文摘要：",
+    ]
+    if not has_oai and not (has_sid and has_sk and sdk_ok):
+        parts.append(
+            "请配置 OPENAI_API_KEY，或配置 TENCENT_SECRET_ID+KEY 并用已安装 tencentcloud-sdk-python 的 Python 运行（如 ./tencent-env/bin/python）；"
+        )
+    elif has_oai and not (has_sid and has_sk and sdk_ok):
+        parts.append("已配置 OpenAI 但本次未得到摘要；若需机翻可配置腾讯密钥+SDK 或设置 BRIEF_TRANSLATE_BACKEND=tencent；")
+    elif has_sid and has_sk and not sdk_ok:
+        parts.append("已配置腾讯密钥但当前 Python 未安装 SDK，请 pip install tencentcloud-sdk-python 或使用项目 venv/tencent-env；")
+    else:
+        parts.append("翻译链路未生效，请检查 .env 与 BRIEF_TRANSLATE_BACKEND；")
+    parts.append("以下为英文索引）")
+    return "".join(parts)
+
+
+def _resolve_translate_backend() -> str:
+    """
+    返回 openai | tencent | none。
+    BRIEF_TRANSLATE_BACKEND=openai|tencent|auto（默认 auto：有 OpenAI 则优先 OpenAI，否则腾讯）
+    """
+    use_openai = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    use_tmt = tencent_translate_configured()
+    b = os.environ.get("BRIEF_TRANSLATE_BACKEND", "auto").strip().lower()
+    if b == "tencent":
+        if use_tmt:
+            return "tencent"
+        if use_openai:
+            print(
+                "[warn] BRIEF_TRANSLATE_BACKEND=tencent 但腾讯不可用，回退 OpenAI。",
+                file=sys.stderr,
+            )
+            return "openai"
+        return "none"
+    if b == "openai":
+        if use_openai:
+            return "openai"
+        if use_tmt:
+            print(
+                "[warn] BRIEF_TRANSLATE_BACKEND=openai 但 OpenAI 未配置，回退腾讯翻译。",
+                file=sys.stderr,
+            )
+            return "tencent"
+        return "none"
+    if use_openai:
+        return "openai"
+    if use_tmt:
+        return "tencent"
+    return "none"
 
 
 def _source_label(source: str) -> str:
@@ -351,12 +410,34 @@ def build_digest_items(hn: list[Item], rss: list[Item], gh: list[Item]) -> str:
 
 def prepend_chinese_notice_for_english_digest(digest: str) -> str:
     notice = (
-        "【说明】当前未配置 OPENAI_API_KEY，也未正确配置腾讯翻译（TENCENT_SECRET_ID + TENCENT_SECRET_KEY 且已安装 SDK）：\n"
+        "【说明】当前未配置 OPENAI_API_KEY，也未正确配置腾讯翻译（TENCENT_SECRET_ID 或 TENCENT_TRANSLATE_SECRET_ID 等，且已安装 SDK）：\n"
         "资讯标题与 GitHub 行为英文原文，仅界面为中文。\n"
         "可选：在 .env 中配置腾讯密钥并执行 pip install -r scripts/requirements-tmt.txt；或配置 OPENAI_API_KEY。\n"
         "────────────\n\n"
     )
     return notice + digest
+
+
+def _env_tencent_secret_id() -> str:
+    return (
+        os.environ.get("TENCENT_SECRET_ID", "").strip()
+        or os.environ.get("TENCENT_TRANSLATE_SECRET_ID", "").strip()
+    )
+
+
+def _env_tencent_secret_key() -> str:
+    return (
+        os.environ.get("TENCENT_SECRET_KEY", "").strip()
+        or os.environ.get("TENCENT_TRANSLATE_SECRET_KEY", "").strip()
+    )
+
+
+def _env_tencent_region() -> str:
+    return (
+        os.environ.get("TENCENT_TMT_REGION", "").strip()
+        or os.environ.get("TENCENT_TRANSLATE_REGION", "").strip()
+        or "ap-guangzhou"
+    )
 
 
 def _tencent_sdk_import():
@@ -372,9 +453,9 @@ def _tencent_sdk_import():
 
 
 def tencent_translate_configured() -> bool:
-    if not os.environ.get("TENCENT_SECRET_ID", "").strip():
+    if not _env_tencent_secret_id():
         return False
-    if not os.environ.get("TENCENT_SECRET_KEY", "").strip():
+    if not _env_tencent_secret_key():
         return False
     return _tencent_sdk_import() is not None
 
@@ -384,9 +465,9 @@ def _tencent_tmt_client() -> Any | None:
     if not mod:
         return None
     credential, ClientProfile, HttpProfile, _models, tmt_client = mod
-    sid = os.environ.get("TENCENT_SECRET_ID", "").strip()
-    sk = os.environ.get("TENCENT_SECRET_KEY", "").strip()
-    region = os.environ.get("TENCENT_TMT_REGION", "ap-guangzhou").strip()
+    sid = _env_tencent_secret_id()
+    sk = _env_tencent_secret_key()
+    region = _env_tencent_region()
     if not sid or not sk:
         return None
     cred = credential.Credential(sid, sk)
@@ -397,8 +478,29 @@ def _tencent_tmt_client() -> Any | None:
     return tmt_client.TmtClient(cred, region, cp)
 
 
+def _tencent_text_translate_one(
+    client: Any, models: Any, text: str, *, pause_sec: float = 0.22
+) -> str:
+    """单条 TextTranslate；失败返回原文。pause_sec 用于避免触发每秒 5 次 QPS 限制。"""
+    if pause_sec > 0:
+        time.sleep(pause_sec)
+    if not text.strip():
+        return text
+    req = models.TextTranslateRequest()
+    req.SourceText = text[:2000]
+    req.Source = "auto"
+    req.Target = "zh"
+    req.ProjectId = 0
+    try:
+        resp = client.TextTranslate(req)
+        return (resp.TargetText or text).strip() or text
+    except Exception as e:
+        print(f"[warn] 腾讯翻译单条失败: {e}", file=sys.stderr)
+        return text
+
+
 def tencent_translate_batch_list(strings: list[str]) -> list[str]:
-    """auto → zh，顺序与输入一致；失败条回退原文。"""
+    """auto → zh，顺序与输入一致；失败条回退原文。兼容无 Batch API 的旧版 SDK。"""
     if not strings:
         return []
     client = _tencent_tmt_client()
@@ -406,30 +508,42 @@ def tencent_translate_batch_list(strings: list[str]) -> list[str]:
     if not client or not mod:
         return list(strings)
     _credential, _cp, _hp, models, _tc = mod
-    out: list[str] = []
-    chunk_max = 45
-    for i in range(0, len(strings), chunk_max):
-        chunk = strings[i : i + chunk_max]
-        req = models.TextTranslateBatchRequest()
-        req.Source = "auto"
-        req.Target = "zh"
-        req.ProjectId = 0
-        req.SourceTextList = chunk
-        try:
-            resp = client.TextTranslateBatch(req)
-            tl = list(resp.TargetTextList) if getattr(resp, "TargetTextList", None) else []
-            if len(tl) != len(chunk):
-                print(
-                    "[warn] 腾讯翻译返回条数与请求不一致，本批回退原文。",
-                    file=sys.stderr,
-                )
-                out.extend(chunk)
-            else:
-                out.extend(tl)
-        except Exception as e:
-            print(f"[warn] 腾讯翻译批量接口失败: {e}", file=sys.stderr)
-            out.extend(chunk)
-    return out
+    batch_cls = getattr(models, "TextTranslateBatchRequest", None)
+    if batch_cls is not None and hasattr(client, "TextTranslateBatch"):
+        out: list[str] = []
+        chunk_max = 45
+        for i in range(0, len(strings), chunk_max):
+            chunk = strings[i : i + chunk_max]
+            req = batch_cls()
+            req.Source = "auto"
+            req.Target = "zh"
+            req.ProjectId = 0
+            req.SourceTextList = chunk
+            try:
+                resp = client.TextTranslateBatch(req)
+                tl = list(resp.TargetTextList) if getattr(resp, "TargetTextList", None) else []
+                if len(tl) != len(chunk):
+                    print(
+                        "[warn] 腾讯翻译批量返回条数不一致，本批改单条重试。",
+                        file=sys.stderr,
+                    )
+                    for t in chunk:
+                        out.append(
+                            _tencent_text_translate_one(client, models, t, pause_sec=0.22)
+                        )
+                else:
+                    out.extend(tl)
+            except Exception as e:
+                print(f"[warn] 腾讯翻译批量失败，改单条: {e}", file=sys.stderr)
+                for t in chunk:
+                    out.append(
+                        _tencent_text_translate_one(client, models, t, pause_sec=0.22)
+                    )
+        return out
+    out_one: list[str] = []
+    for t in strings:
+        out_one.append(_tencent_text_translate_one(client, models, t, pause_sec=0.22))
+    return out_one
 
 
 def tencent_translate_news_items(items: list[Item]) -> list[Item]:
@@ -657,7 +771,8 @@ def load_dotenv_file(path: str) -> None:
 
 def main() -> int:
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    load_dotenv_file(os.path.join(script_dir, ".env"))
+    env_path = os.path.join(script_dir, ".env")
+    load_dotenv_file(env_path)
 
     hn = fetch_hn_stories()
     rss = fetch_rss_items()
@@ -668,17 +783,20 @@ def main() -> int:
     rss_orig = copy.deepcopy(rss)
     gh_fb_ref = copy.deepcopy(gh_fb)
 
-    has_llm = bool(os.environ.get("OPENAI_API_KEY", "").strip())
-    has_tmt = tencent_translate_configured()
-    if os.environ.get("TENCENT_SECRET_ID", "").strip() and not has_tmt:
-        if not os.environ.get("TENCENT_SECRET_KEY", "").strip():
+    backend = _resolve_translate_backend()
+    has_llm = backend == "openai"
+    has_tmt = backend == "tencent"
+    sums: dict[str, str] | None = None
+    if _env_tencent_secret_id() and not tencent_translate_configured():
+        if not _env_tencent_secret_key():
             print(
-                "[warn] 已设置 TENCENT_SECRET_ID 但缺少 TENCENT_SECRET_KEY。",
+                "[warn] 已设置腾讯 SecretId 但缺少 SecretKey（TENCENT_SECRET_KEY 或 TENCENT_TRANSLATE_SECRET_KEY）。",
                 file=sys.stderr,
             )
         elif _tencent_sdk_import() is None:
             print(
-                "[warn] 使用腾讯翻译需安装：pip install -r scripts/requirements-tmt.txt",
+                "[warn] 使用腾讯翻译需安装：pip install -r scripts/requirements-tmt.txt，"
+                "并用带 SDK 的 Python 运行（如 ./tencent-env/bin/python）。",
                 file=sys.stderr,
             )
 
@@ -690,6 +808,12 @@ def main() -> int:
         hn = llm_translate_news_items(hn)
         rss = llm_translate_news_items(rss)
         sums = llm_github_summaries_zh(merged)
+        if not sums and tencent_translate_configured():
+            print(
+                "[info] OpenAI 未返回 GitHub 摘要，改用腾讯翻译生成百字摘要…",
+                file=sys.stderr,
+            )
+            sums = tencent_github_summaries_tmt(merged)
         gh = (
             _github_repos_to_items_with_summaries(merged, sums)
             if sums
